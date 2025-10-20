@@ -1,10 +1,10 @@
-import re
-import os
 import logging
+import os
+import re
 
-from mutagen.flac import FLAC, Picture
 import mutagen.id3 as id3
-from mutagen.id3 import ID3NoHeaderError
+from mutagen.flac import FLAC, Picture
+from mutagen.id3._util import ID3NoHeaderError  # type: ignore[attr-defined]
 
 logger = logging.getLogger(__name__)
 
@@ -15,20 +15,21 @@ COPYRIGHT, PHON_COPYRIGHT = "\u2117", "\u00a9"
 # and the file won't be tagged
 FLAC_MAX_BLOCKSIZE = 16777215
 
+# Map logical tag names to ID3 frame names (avoid static attribute lookups for editor/type stubs)
 ID3_LEGEND = {
-    "album": id3.TALB,
-    "albumartist": id3.TPE2,
-    "artist": id3.TPE1,
-    "comment": id3.COMM,
-    "composer": id3.TCOM,
-    "copyright": id3.TCOP,
-    "date": id3.TDAT,
-    "genre": id3.TCON,
-    "isrc": id3.TSRC,
-    "label": id3.TPUB,
-    "performer": id3.TOPE,
-    "title": id3.TIT2,
-    "year": id3.TYER,
+    "album": "TALB",
+    "albumartist": "TPE2",
+    "artist": "TPE1",
+    "comment": "COMM",
+    "composer": "TCOM",
+    "copyright": "TCOP",
+    "date": "TDAT",
+    "genre": "TCON",
+    "isrc": "TSRC",
+    "label": "TPUB",
+    "performer": "TOPE",
+    "title": "TIT2",
+    "year": "TYER",
 }
 
 
@@ -58,8 +59,10 @@ def _format_genres(genres: list) -> str:
     'Pop, Rock, Alternatif et Indé'
     """
     genres = re.findall(r"([^\u2192\/]+)", "/".join(genres))
-    no_repeats = []
-    [no_repeats.append(g) for g in genres if g not in no_repeats]
+    no_repeats: list[str] = []
+    for g in genres:
+        if g not in no_repeats:
+            no_repeats.append(g)
     return ", ".join(no_repeats)
 
 
@@ -104,7 +107,16 @@ def _embed_id3_img(root_dir, audio: id3.ID3):
         cover_image = multi_emb_image
 
     with open(cover_image, "rb") as cover:
-        audio.add(id3.APIC(3, "image/jpeg", 3, "", cover.read()))
+        APIC = getattr(id3, "APIC")
+        audio.add(
+            APIC(
+                encoding=3,
+                mime="image/jpeg",
+                type=3,
+                desc="",
+                data=cover.read(),
+            )
+        )
 
 
 # Use KeyError catching instead of dict.get to avoid empty tags
@@ -214,16 +226,19 @@ def tag_mp3(filename, root_dir, final_name, d, album, istrack=True, em_image=Fal
 
     tags["year"] = tags["date"][:4]
 
-    audio["TRCK"] = id3.TRCK(encoding=3, text=f'{d["track_number"]}/{tracktotal}')
-    audio["TPOS"] = id3.TPOS(encoding=3, text=str(d["media_number"]))
+    TRCK = getattr(id3, "TRCK")
+    TPOS = getattr(id3, "TPOS")
+    audio["TRCK"] = TRCK(encoding=3, text=f'{d["track_number"]}/{tracktotal}')
+    audio["TPOS"] = TPOS(encoding=3, text=str(d["media_number"]))
 
     # write metadata in `tags` to file
     for k, v in tags.items():
-        id3tag = ID3_LEGEND[k]
-        audio[id3tag.__name__] = id3tag(encoding=3, text=v)
+        frame_name = ID3_LEGEND[k]
+        frame_cls = getattr(id3, frame_name)
+        audio[frame_name] = frame_cls(encoding=3, text=v)
 
     if em_image:
         _embed_id3_img(root_dir, audio)
 
-    audio.save(filename, "v2_version=3")
+    audio.save(filename, v2_version=3)
     os.rename(filename, final_name)

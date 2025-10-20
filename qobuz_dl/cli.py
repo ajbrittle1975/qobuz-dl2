@@ -1,32 +1,33 @@
+import asyncio
 import configparser
+import glob
 import hashlib
 import logging
-import glob
 import os
 import sys
+from typing import Any, Callable, Dict, Optional
+
+import click
 
 from qobuz_dl.bundle import Bundle
 from qobuz_dl.color import GREEN, RED, YELLOW
-from qobuz_dl.commands import qobuz_dl_args
 from qobuz_dl.core import QobuzDL
 from qobuz_dl.downloader import DEFAULT_FOLDER, DEFAULT_TRACK
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 if os.name == "nt":
-    OS_CONFIG = os.environ.get("APPDATA")
+    # Ensure a valid string path even if APPDATA is unset
+    OS_CONFIG = os.environ.get("APPDATA") or os.path.expanduser("~")
 else:
-    OS_CONFIG = os.path.join(os.environ["HOME"], ".config")
+    OS_CONFIG = os.path.expanduser("~/.config")
 
 CONFIG_PATH = os.path.join(OS_CONFIG, "qobuz-dl")
 CONFIG_FILE = os.path.join(CONFIG_PATH, "config.ini")
 QOBUZ_DB = os.path.join(CONFIG_PATH, "qobuz_dl.db")
 
 
-def _reset_config(config_file):
+def _reset_config(config_file: str) -> None:
     logging.info(f"{YELLOW}Creating config file: {config_file}")
     config = configparser.ConfigParser()
     config["DEFAULT"]["email"] = input("Enter your email:\n- ")
@@ -59,6 +60,7 @@ def _reset_config(config_file):
     config["DEFAULT"]["folder_format"] = DEFAULT_FOLDER
     config["DEFAULT"]["track_format"] = DEFAULT_TRACK
     config["DEFAULT"]["smart_discography"] = "false"
+    os.makedirs(os.path.dirname(config_file), exist_ok=True)
     with open(config_file, "w") as configfile:
         config.write(configfile)
     logging.info(
@@ -68,118 +70,420 @@ def _reset_config(config_file):
     )
 
 
-def _remove_leftovers(directory):
+def _remove_leftovers(directory: str) -> None:
     directory = os.path.join(directory, "**", ".*.tmp")
     for i in glob.glob(directory, recursive=True):
         try:
             os.remove(i)
-        except:  # noqa
+        except Exception:
             pass
 
 
-def _handle_commands(qobuz, arguments):
-    try:
-        if arguments.command == "dl":
-            qobuz.download_list_of_urls(arguments.SOURCE)
-        elif arguments.command == "lucky":
-            query = " ".join(arguments.QUERY)
-            qobuz.lucky_type = arguments.type
-            qobuz.lucky_limit = arguments.number
-            qobuz.lucky_mode(query)
-        else:
-            qobuz.interactive_limit = arguments.limit
-            qobuz.interactive()
-
-    except KeyboardInterrupt:
-        logging.info(
-            f"{RED}Interrupted by user\n{YELLOW}Already downloaded items will "
-            "be skipped if you try to download the same releases again."
-        )
-
-    finally:
-        _remove_leftovers(qobuz.directory)
-
-
-def _initial_checks():
+def _ensure_config_exists() -> None:
     if not os.path.isdir(CONFIG_PATH) or not os.path.isfile(CONFIG_FILE):
         os.makedirs(CONFIG_PATH, exist_ok=True)
         _reset_config(CONFIG_FILE)
 
-    if len(sys.argv) < 2:
-        sys.exit(qobuz_dl_args().print_help())
 
-
-def main():
-    _initial_checks()
-
-    config = configparser.ConfigParser()
-    config.read(CONFIG_FILE)
-
+def _load_config() -> Dict[str, Any]:
+    cfg = configparser.ConfigParser()
+    cfg.read(CONFIG_FILE)
     try:
-        email = config["DEFAULT"]["email"]
-        password = config["DEFAULT"]["password"]
-        default_folder = config["DEFAULT"]["default_folder"]
-        default_limit = config["DEFAULT"]["default_limit"]
-        default_quality = config["DEFAULT"]["default_quality"]
-        no_m3u = config.getboolean("DEFAULT", "no_m3u")
-        albums_only = config.getboolean("DEFAULT", "albums_only")
-        no_fallback = config.getboolean("DEFAULT", "no_fallback")
-        og_cover = config.getboolean("DEFAULT", "og_cover")
-        embed_art = config.getboolean("DEFAULT", "embed_art")
-        no_cover = config.getboolean("DEFAULT", "no_cover")
-        no_database = config.getboolean("DEFAULT", "no_database")
-        app_id = config["DEFAULT"]["app_id"]
-        smart_discography = config.getboolean("DEFAULT", "smart_discography")
-        folder_format = config["DEFAULT"]["folder_format"]
-        track_format = config["DEFAULT"]["track_format"]
-
-        secrets = [
-            secret for secret in config["DEFAULT"]["secrets"].split(",") if secret
-        ]
-        arguments = qobuz_dl_args(
-            default_quality, default_limit, default_folder
-        ).parse_args()
+        email = cfg["DEFAULT"]["email"]
+        password = cfg["DEFAULT"]["password"]
+        default_folder = cfg["DEFAULT"]["default_folder"]
+        default_limit = cfg["DEFAULT"]["default_limit"]
+        default_quality = cfg["DEFAULT"]["default_quality"]
+        no_m3u = cfg.getboolean("DEFAULT", "no_m3u")
+        albums_only = cfg.getboolean("DEFAULT", "albums_only")
+        no_fallback = cfg.getboolean("DEFAULT", "no_fallback")
+        og_cover = cfg.getboolean("DEFAULT", "og_cover")
+        embed_art = cfg.getboolean("DEFAULT", "embed_art")
+        no_cover = cfg.getboolean("DEFAULT", "no_cover")
+        no_database = cfg.getboolean("DEFAULT", "no_database")
+        app_id = cfg["DEFAULT"]["app_id"]
+        smart_discography = cfg.getboolean("DEFAULT", "smart_discography")
+        folder_format = cfg["DEFAULT"]["folder_format"]
+        track_format = cfg["DEFAULT"]["track_format"]
+        secrets = [s for s in cfg["DEFAULT"]["secrets"].split(",") if s]
     except (KeyError, UnicodeDecodeError, configparser.Error) as error:
-        arguments = qobuz_dl_args().parse_args()
-        if not arguments.reset:
-            sys.exit(
-                f"{RED}Your config file is corrupted: {error}! "
-                "Run 'qobuz-dl -r' to fix this."
-            )
+        raise RuntimeError(
+            f"{RED}Your config file is corrupted: {error}! "
+            "Run 'qobuz-dl -r' to fix this."
+        )
+    return {
+        "email": email,
+        "password": password,
+        "app_id": app_id,
+        "secrets": secrets,
+        "defaults": {
+            "default_folder": default_folder,
+            "default_limit": int(default_limit) if str(default_limit).isdigit() else 20,
+            "default_quality": (
+                int(default_quality) if str(default_quality).isdigit() else 6
+            ),
+            "no_m3u": no_m3u,
+            "albums_only": albums_only,
+            "no_fallback": no_fallback,
+            "og_cover": og_cover,
+            "embed_art": embed_art,
+            "no_cover": no_cover,
+            "no_database": no_database,
+            "folder_format": folder_format,
+            "track_format": track_format,
+            "smart_discography": smart_discography,
+        },
+    }
 
-    if arguments.reset:
-        sys.exit(_reset_config(CONFIG_FILE))
 
-    if arguments.show_config:
-        print(f"Configuation: {CONFIG_FILE}\nDatabase: {QOBUZ_DB}\n---")
+async def _build_qobuz(
+    ctx: click.Context,
+    *,
+    directory: Optional[str] = None,
+    quality: Optional[int] = None,
+    embed_art: Optional[bool] = None,
+    albums_only: Optional[bool] = None,
+    no_m3u: Optional[bool] = None,
+    no_fallback: Optional[bool] = None,
+    og_cover: Optional[bool] = None,
+    no_cover: Optional[bool] = None,
+    no_db: Optional[bool] = None,
+    folder_format: Optional[str] = None,
+    track_format: Optional[str] = None,
+    smart_discography: Optional[bool] = None,
+) -> QobuzDL:
+    cfg = ctx.obj
+    dflt = cfg["defaults"]
+    effective = {
+        "directory": directory or dflt["default_folder"],
+        "quality": int(quality if quality is not None else dflt["default_quality"]),
+        "embed_art": bool(embed_art if embed_art is not None else dflt["embed_art"]),
+        "ignore_singles_eps": bool(
+            albums_only if albums_only is not None else dflt["albums_only"]
+        ),
+        "no_m3u_for_playlists": bool(no_m3u if no_m3u is not None else dflt["no_m3u"]),
+        "quality_fallback": not (
+            no_fallback if no_fallback is not None else dflt["no_fallback"]
+        ),
+        "cover_og_quality": bool(
+            og_cover if og_cover is not None else dflt["og_cover"]
+        ),
+        "no_cover": bool(no_cover if no_cover is not None else dflt["no_cover"]),
+        "downloads_db": (
+            None if (no_db if no_db is not None else dflt["no_database"]) else QOBUZ_DB
+        ),
+        "folder_format": folder_format or dflt["folder_format"],
+        "track_format": track_format or dflt["track_format"],
+        "smart_discography": bool(
+            smart_discography
+            if smart_discography is not None
+            else dflt["smart_discography"]
+        ),
+    }
+    q = QobuzDL(**effective)
+    await q.initialize_client(
+        cfg["email"], cfg["password"], cfg["app_id"], cfg["secrets"]
+    )
+    return q
+
+
+def _common_options() -> Callable:
+    def decorator(f: Callable) -> Callable:
+        options = [
+            click.option(
+                "-d",
+                "--directory",
+                metavar="PATH",
+                type=click.Path(path_type=str),
+                help="directory for downloads (default from config)",
+            ),
+            click.option(
+                "-q",
+                "--quality",
+                metavar="int",
+                type=int,
+                help='audio "quality" (5, 6, 7, 27)',
+            ),
+            click.option(
+                "--albums-only",
+                is_flag=True,
+                help="don't download singles, EPs and VA releases",
+            ),
+            click.option(
+                "--no-m3u",
+                is_flag=True,
+                help="don't create .m3u files when downloading playlists",
+            ),
+            click.option(
+                "--no-fallback",
+                is_flag=True,
+                help="disable quality fallback (skip releases not available in set quality)",
+            ),
+            click.option(
+                "-e", "--embed-art", is_flag=True, help="embed cover art into files"
+            ),
+            click.option(
+                "--og-cover",
+                is_flag=True,
+                help="download cover art in its original quality (bigger file)",
+            ),
+            click.option("--no-cover", is_flag=True, help="don't download cover art"),
+            click.option("--no-db", is_flag=True, help="don't call the database"),
+            click.option(
+                "-ff",
+                "--folder-format",
+                metavar="PATTERN",
+                help="pattern for formatting folder names",
+            ),
+            click.option(
+                "-tf",
+                "--track-format",
+                metavar="PATTERN",
+                help="pattern for formatting track names",
+            ),
+            click.option(
+                "-s",
+                "--smart-discography",
+                is_flag=True,
+                help="Enable heuristics to reduce spam-like albums in artist discographies",
+            ),
+        ]
+        for opt in reversed(options):
+            f = opt(f)
+        return f
+
+    return decorator
+
+
+@click.group(context_settings=dict(help_option_names=["-h", "--help"]))
+@click.option("-r", "--reset", is_flag=True, help="create/reset config file")
+@click.option(
+    "-p", "--purge", is_flag=True, help="purge/delete downloaded-IDs database"
+)
+@click.option("-sc", "--show-config", is_flag=True, help="show configuration")
+@click.pass_context
+def cli(ctx: click.Context, reset: bool, purge: bool, show_config: bool) -> None:
+    """The ultimate Qobuz music downloader."""
+    # Bootstrapping and config lifecycle
+    os.makedirs(CONFIG_PATH, exist_ok=True)
+    if reset:
+        _reset_config(CONFIG_FILE)
+        ctx.exit(0)
+
+    _ensure_config_exists()
+
+    if show_config:
+        click.echo(f"Configuration: {CONFIG_FILE}\nDatabase: {QOBUZ_DB}\n---")
         with open(CONFIG_FILE, "r") as f:
-            print(f.read())
-        sys.exit()
+            click.echo(f.read())
+        ctx.exit(0)
 
-    if arguments.purge:
+    if purge:
         try:
             os.remove(QOBUZ_DB)
         except FileNotFoundError:
             pass
-        sys.exit(f"{GREEN}The database was deleted.")
+        click.echo(f"{GREEN}The database was deleted.")
+        ctx.exit(0)
 
-    qobuz = QobuzDL(
-        arguments.directory,
-        arguments.quality,
-        arguments.embed_art or embed_art,
-        ignore_singles_eps=arguments.albums_only or albums_only,
-        no_m3u_for_playlists=arguments.no_m3u or no_m3u,
-        quality_fallback=not arguments.no_fallback or not no_fallback,
-        cover_og_quality=arguments.og_cover or og_cover,
-        no_cover=arguments.no_cover or no_cover,
-        downloads_db=None if no_database or arguments.no_db else QOBUZ_DB,
-        folder_format=arguments.folder_format or folder_format,
-        track_format=arguments.track_format or track_format,
-        smart_discography=arguments.smart_discography or smart_discography,
-    )
-    qobuz.initialize_client(email, password, app_id, secrets)
+    try:
+        ctx.obj = _load_config()
+    except RuntimeError as e:
+        click.echo(str(e))
+        ctx.exit(2)
 
-    _handle_commands(qobuz, arguments)
+
+@cli.command("fun")
+@_common_options()
+@click.option(
+    "-l",
+    "--limit",
+    metavar="int",
+    type=int,
+    help="limit of search results (default from config)",
+)
+@click.pass_context
+def fun_cmd(
+    ctx: click.Context,
+    limit: Optional[int],
+    directory: Optional[str],
+    quality: Optional[int],
+    embed_art: Optional[bool],
+    albums_only: Optional[bool],
+    no_m3u: Optional[bool],
+    no_fallback: Optional[bool],
+    og_cover: Optional[bool],
+    no_cover: Optional[bool],
+    no_db: Optional[bool],
+    folder_format: Optional[str],
+    track_format: Optional[str],
+    smart_discography: Optional[bool],
+) -> None:
+    """Interactive mode."""
+
+    async def runner() -> None:
+        q = await _build_qobuz(
+            ctx,
+            directory=directory,
+            quality=quality,
+            embed_art=embed_art,
+            albums_only=albums_only,
+            no_m3u=no_m3u,
+            no_fallback=no_fallback,
+            og_cover=og_cover,
+            no_cover=no_cover,
+            no_db=no_db,
+            folder_format=folder_format,
+            track_format=track_format,
+            smart_discography=smart_discography,
+        )
+        dflt_limit = ctx.obj["defaults"]["default_limit"]
+        q.interactive_limit = int(limit) if limit is not None else int(dflt_limit)
+        try:
+            await q.interactive()
+        except KeyboardInterrupt:
+            logging.info(
+                f"{RED}Interrupted by user\n{YELLOW}Already downloaded items will "
+                "be skipped if you try to download the same releases again."
+            )
+        finally:
+            _remove_leftovers(q.directory)
+
+    asyncio.run(runner())
+
+
+@cli.command("dl")
+@_common_options()
+@click.argument("source", nargs=-1, required=True)
+@click.pass_context
+def dl_cmd(
+    ctx: click.Context,
+    source: tuple[str, ...],
+    directory: Optional[str],
+    quality: Optional[int],
+    embed_art: Optional[bool],
+    albums_only: Optional[bool],
+    no_m3u: Optional[bool],
+    no_fallback: Optional[bool],
+    og_cover: Optional[bool],
+    no_cover: Optional[bool],
+    no_db: Optional[bool],
+    folder_format: Optional[str],
+    track_format: Optional[str],
+    smart_discography: Optional[bool],
+) -> None:
+    """Input mode: download by album/track/artist/label/playlist/last.fm-playlist URL(s) or a text file."""
+
+    async def runner() -> None:
+        q = await _build_qobuz(
+            ctx,
+            directory=directory,
+            quality=quality,
+            embed_art=embed_art,
+            albums_only=albums_only,
+            no_m3u=no_m3u,
+            no_fallback=no_fallback,
+            og_cover=og_cover,
+            no_cover=no_cover,
+            no_db=no_db,
+            folder_format=folder_format,
+            track_format=track_format,
+            smart_discography=smart_discography,
+        )
+        try:
+            await q.download_list_of_urls(list(source))
+        except KeyboardInterrupt:
+            logging.info(
+                f"{RED}Interrupted by user\n{YELLOW}Already downloaded items will "
+                "be skipped if you try to download the same releases again."
+            )
+        finally:
+            _remove_leftovers(q.directory)
+
+    asyncio.run(runner())
+
+
+@cli.command("lucky")
+@_common_options()
+@click.option(
+    "-t",
+    "--type",
+    "type_",
+    default=None,
+    show_default=False,
+    help="type of items to search (artist, album, track, playlist)",
+)
+@click.option(
+    "-n",
+    "--number",
+    metavar="int",
+    type=int,
+    default=None,
+    show_default=False,
+    help="number of results to download",
+)
+@click.argument("query", nargs=-1, required=True)
+@click.pass_context
+def lucky_cmd(
+    ctx: click.Context,
+    query: tuple[str, ...],
+    type_: Optional[str],
+    number: Optional[int],
+    directory: Optional[str],
+    quality: Optional[int],
+    embed_art: Optional[bool],
+    albums_only: Optional[bool],
+    no_m3u: Optional[bool],
+    no_fallback: Optional[bool],
+    og_cover: Optional[bool],
+    no_cover: Optional[bool],
+    no_db: Optional[bool],
+    folder_format: Optional[str],
+    track_format: Optional[str],
+    smart_discography: Optional[bool],
+) -> None:
+    """Lucky mode: Download the first <n> results from a Qobuz search."""
+
+    async def runner() -> None:
+        q = await _build_qobuz(
+            ctx,
+            directory=directory,
+            quality=quality,
+            embed_art=embed_art,
+            albums_only=albums_only,
+            no_m3u=no_m3u,
+            no_fallback=no_fallback,
+            og_cover=og_cover,
+            no_cover=no_cover,
+            no_db=no_db,
+            folder_format=folder_format,
+            track_format=track_format,
+            smart_discography=smart_discography,
+        )
+        q.lucky_type = (type_ or "album").lower()
+        q.lucky_limit = int(number) if number is not None else 1
+        query_str = " ".join(query)
+        try:
+            await q.lucky_mode(query_str)
+        except KeyboardInterrupt:
+            logging.info(
+                f"{RED}Interrupted by user\n{YELLOW}Already downloaded items will "
+                "be skipped if you try to download the same releases again."
+            )
+        finally:
+            _remove_leftovers(q.directory)
+
+    asyncio.run(runner())
+
+
+def main() -> int:
+    # If no subcommand provided, Click will show help automatically.
+    try:
+        cli(prog_name="qobuz-dl", standalone_mode=True)
+        return 0
+    except SystemExit as e:
+        # Normalize exit code
+        return int(e.code) if e.code is not None else 0
 
 
 if __name__ == "__main__":

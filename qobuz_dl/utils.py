@@ -1,11 +1,11 @@
+import logging
+import os
 import re
 import string
-import os
-import logging
 import time
 
-from mutagen.mp3 import EasyMP3
 from mutagen.flac import FLAC
+from mutagen.mp3 import EasyMP3
 
 logger = logging.getLogger(__name__)
 
@@ -23,11 +23,11 @@ class PartialFormatter(string.Formatter):
             val = None, field_name
         return val
 
-    def format_field(self, value, spec):
+    def format_field(self, value, format_spec):
         if not value:
             return self.missing
         try:
-            return super(PartialFormatter, self).format_field(value, spec)
+            return super(PartialFormatter, self).format_field(value, format_spec)
         except ValueError:
             if self.bad_fmt:
                 return self.bad_fmt
@@ -94,8 +94,8 @@ def smart_discography_filter(
     def print_album(album: dict) -> None:
         logger.debug(
             f"{album['title']} - {album.get('version', '~~')} "
-            "({album['maximum_bit_depth']}/{album['maximum_sampling_rate']}"
-            " by {album['artist']['name']}) {album['id']}"
+            f"({album.get('maximum_bit_depth')}/{album.get('maximum_sampling_rate')}"
+            f" by {album['artist']['name']}) {album['id']}"
         )
 
     TYPE_REGEXES = {
@@ -115,14 +115,16 @@ def smart_discography_filter(
         Used to group two albums that may be named similarly, but not exactly
         the same.
         """
-        r = re.match(r"([^\(]+)(?:\s*[\(\[][^\)][\)\]])*", album)
-        return r.group(1).strip().lower()
+        title = str(album.get("title", ""))
+        m = re.match(r"^([^\(\[]+)", title)
+        base = m.group(1) if m else title
+        return base.strip().lower()
 
     requested_artist = contents[0]["name"]
     items = [item["albums"]["items"] for item in contents][0]
 
     # use dicts to group duplicate albums together by title
-    title_grouped = dict()
+    title_grouped: dict[str, list[dict]] = {}
     for item in items:
         title_ = essence(item["title"])
         if title_ not in title_grouped:  # ?
@@ -172,7 +174,7 @@ def create_and_return_dir(directory):
     return fix
 
 
-def get_url_info(url):
+def get_url_info(url: str) -> tuple[str, str]:
     """Returns the type of the url and the id.
 
     Compatible with urls of the form:
@@ -181,10 +183,11 @@ def get_url_info(url):
         https://play.qobuz.com/{type}/{id}
         /us-en/{type}/-/{id}
     """
-
-    r = re.search(
+    m = re.search(
         r"(?:https:\/\/(?:w{3}|open|play)\.qobuz\.com)?(?:\/[a-z]{2}-[a-z]{2})"
         r"?\/(album|artist|track|playlist|label)(?:\/[-\w\d]+)?\/([\w\d]+)",
         url,
     )
-    return r.groups()
+    if not m:
+        raise ValueError(f"Invalid Qobuz URL: {url!r}")
+    return m.group(1), m.group(2)

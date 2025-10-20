@@ -1,13 +1,22 @@
+import asyncio
 import logging
 import os
-from typing import Tuple
+from typing import Optional, Tuple
 
-import requests
+import httpx
 from pathvalidate import sanitize_filename, sanitize_filepath
-from tqdm import tqdm
+from rich.progress import (
+    BarColumn,
+    DownloadColumn,
+    Progress,
+    TextColumn,
+    TimeRemainingColumn,
+    TransferSpeedColumn,
+)
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 import qobuz_dl.metadata as metadata
-from qobuz_dl.color import OFF, GREEN, RED, YELLOW, CYAN
+from qobuz_dl.color import GREEN, OFF, RED, YELLOW
 from qobuz_dl.exceptions import NonStreamable
 
 QL_DOWNGRADE = "FormatRestrictedByFormatAvailability"
@@ -43,6 +52,7 @@ class Download:
         no_cover: bool = False,
         folder_format=None,
         track_format=None,
+        limit: int = 4,
     ):
         self.client = client
         self.item_id = item_id
@@ -55,16 +65,36 @@ class Download:
         self.no_cover = no_cover
         self.folder_format = folder_format or DEFAULT_FOLDER
         self.track_format = track_format or DEFAULT_TRACK
+        self.semaphore = asyncio.Semaphore(limit)
+        self.progress = Progress(
+            TextColumn("[bold blue]{task.description}", justify="right"),
+            BarColumn(bar_width=None),
+            "[progress.percentage]{task.percentage:>3.1f}%",
+            "•",
+            DownloadColumn(),
+            "•",
+            TransferSpeedColumn(),
+            "•",
+            TimeRemainingColumn(),
+        )
 
-    def download_id_by_type(self, track=True):
-        if not track:
-            self.download_release()
-        else:
-            self.download_track()
+    async def download_id_by_type(self, track=True):
+        # Progress is a synchronous context manager; httpx.AsyncClient is async.
+        # Nest them to satisfy type checkers and runtime semantics.
+        with self.progress:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+                if not track:
+                    await self.download_release(client)
+                else:
+                    await self.download_track(client)
 
-    def download_release(self):
-        count = 0
-        meta = self.client.get_album_meta(self.item_id)
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type(httpx.HTTPError),
+    )
+    async def download_release(self, client: httpx.AsyncClient):
+        meta = await self.client.get_album_meta(self.item_id)
 
         if not meta.get("streamable"):
             raise NonStreamable("This release is not streamable")
@@ -77,8 +107,7 @@ class Download:
             return
 
         album_title = _get_title(meta)
-
-        format_info = self._get_format(meta)
+        format_info = await self._get_format(meta)
         file_format, quality_met, bit_depth, sampling_rate = format_info
 
         if not self.downgrade_quality and not quality_met:
@@ -94,111 +123,143 @@ class Download:
         album_attr = self._get_album_attr(
             meta, album_title, file_format, bit_depth, sampling_rate
         )
-        folder_format, track_format = _clean_format_str(
+        folder_format, _ = _clean_format_str(
             self.folder_format, self.track_format, file_format
         )
         sanitized_title = sanitize_filepath(folder_format.format(**album_attr))
         dirn = os.path.join(self.path, sanitized_title)
         os.makedirs(dirn, exist_ok=True)
 
-        if self.no_cover:
-            logger.info(f"{OFF}Skipping cover")
-        else:
-            _get_extra(meta["image"]["large"], dirn, og_quality=self.cover_og_quality)
-
-        if "goodies" in meta:
-            try:
-                _get_extra(meta["goodies"][0]["url"], dirn, "booklet.pdf")
-            except:  # noqa
-                pass
-        media_numbers = [track["media_number"] for track in meta["tracks"]["items"]]
-        is_multiple = True if len([*{*media_numbers}]) > 1 else False
-        for i in meta["tracks"]["items"]:
-            parse = self.client.get_track_url(i["id"], fmt_id=self.quality)
-            if "sample" not in parse and parse["sampling_rate"]:
-                is_mp3 = True if int(self.quality) == 5 else False
-                self._download_and_tag(
-                    dirn,
-                    count,
-                    parse,
-                    i,
-                    meta,
-                    False,
-                    is_mp3,
-                    i["media_number"] if is_multiple else None,
-                )
-            else:
-                logger.info(f"{OFF}Demo. Skipping")
-            count = count + 1
-        logger.info(f"{GREEN}Completed")
-
-    def download_track(self):
-        parse = self.client.get_track_url(self.item_id, self.quality)
-
-        if "sample" not in parse and parse["sampling_rate"]:
-            meta = self.client.get_track_meta(self.item_id)
-            track_title = _get_title(meta)
-            artist = _safe_get(meta, "performer", "name")
-            logger.info(f"\n{YELLOW}Downloading: {artist} - {track_title}")
-            format_info = self._get_format(meta, is_track_id=True, track_url_dict=parse)
-            file_format, quality_met, bit_depth, sampling_rate = format_info
-
-            folder_format, track_format = _clean_format_str(
-                self.folder_format, self.track_format, str(bit_depth)
-            )
-
-            if not self.downgrade_quality and not quality_met:
-                logger.info(
-                    f"{OFF}Skipping {track_title} as it doesn't "
-                    "meet quality requirement"
-                )
-                return
-            track_attr = self._get_track_attr(
-                meta, track_title, bit_depth, sampling_rate
-            )
-            sanitized_title = sanitize_filepath(folder_format.format(**track_attr))
-
-            dirn = os.path.join(self.path, sanitized_title)
-            os.makedirs(dirn, exist_ok=True)
-            if self.no_cover:
-                logger.info(f"{OFF}Skipping cover")
-            else:
-                _get_extra(
-                    meta["album"]["image"]["large"],
+        tasks = []
+        if not self.no_cover:
+            tasks.append(
+                self._get_extra(
+                    client,
+                    meta["image"]["large"],
                     dirn,
                     og_quality=self.cover_og_quality,
                 )
-            is_mp3 = True if int(self.quality) == 5 else False
-            self._download_and_tag(
-                dirn,
-                1,
-                parse,
-                meta,
-                meta,
-                True,
-                is_mp3,
-                False,
             )
-        else:
-            logger.info(f"{OFF}Demo. Skipping")
+
+        if "goodies" in meta:
+            try:
+                tasks.append(
+                    self._get_extra(client, meta["goodies"][0]["url"], dirn, "booklet.pdf")
+                )
+            except:  # noqa
+                pass
+
+        media_numbers = [track["media_number"] for track in meta["tracks"]["items"]]
+        is_multiple = len(set(media_numbers)) > 1
+
+        for i, track in enumerate(meta["tracks"]["items"]):
+            tasks.append(
+                self._process_track(
+                    client,
+                    dirn,
+                    i,
+                    track,
+                    meta,
+                    is_multiple,
+                )
+            )
+
+        await asyncio.gather(*tasks)
         logger.info(f"{GREEN}Completed")
 
-    def _download_and_tag(
+    async def _process_track(
         self,
-        root_dir,
-        tmp_count,
-        track_url_dict,
-        track_metadata,
-        album_or_track_metadata,
-        is_track,
-        is_mp3,
-        multiple=None,
+        client: httpx.AsyncClient,
+        dirn: str,
+        count: int,
+        track_meta: dict,
+        album_meta: dict,
+        is_multiple: bool,
+    ):
+        async with self.semaphore:
+            parse = await self.client.get_track_url(track_meta["id"], fmt_id=self.quality)
+            if "sample" not in parse and parse.get("sampling_rate"):
+                is_mp3 = int(self.quality) == 5
+                await self._download_and_tag(
+                    client,
+                    dirn,
+                    count,
+                    parse,
+                    track_meta,
+                    album_meta,
+                    False,
+                    is_mp3,
+                    track_meta["media_number"] if is_multiple else None,
+                )
+            else:
+                logger.info(f"{OFF}Demo track. Skipping")
+
+    async def download_track(self, client: httpx.AsyncClient):
+        parse = await self.client.get_track_url(self.item_id, self.quality)
+
+        if "sample" not in parse and parse.get("sampling_rate"):
+            meta = await self.client.get_track_meta(self.item_id)
+            track_title = _get_title(meta)
+            artist = _safe_get(meta, "performer", "name")
+            logger.info(f"\n{YELLOW}Downloading: {artist} - {track_title}")
+            format_info = await self._get_format(
+                meta, is_track_id=True, track_url_dict=parse
+            )
+            file_format, quality_met, bit_depth, sampling_rate = format_info
+
+            if not self.downgrade_quality and not quality_met:
+                logger.info(
+                    f"{OFF}Skipping {track_title} as it doesn't meet quality requirement"
+                )
+                return
+
+            track_attr = self._get_track_attr(
+                meta, track_title, bit_depth, sampling_rate
+            )
+            folder_format, _ = _clean_format_str(
+                self.folder_format, self.track_format, str(bit_depth)
+            )
+            sanitized_title = sanitize_filepath(folder_format.format(**track_attr))
+            dirn = os.path.join(self.path, sanitized_title)
+            os.makedirs(dirn, exist_ok=True)
+
+            tasks = []
+            if not self.no_cover:
+                tasks.append(
+                    self._get_extra(
+                        client,
+                        meta["album"]["image"]["large"],
+                        dirn,
+                        og_quality=self.cover_og_quality,
+                    )
+                )
+
+            is_mp3 = int(self.quality) == 5
+            tasks.append(
+                self._download_and_tag(
+                    client, dirn, 1, parse, meta, meta, True, is_mp3, None
+                )
+            )
+            await asyncio.gather(*tasks)
+        else:
+            logger.info(f"{OFF}Demo track. Skipping")
+        logger.info(f"{GREEN}Completed")
+
+    async def _download_and_tag(
+        self,
+        client: httpx.AsyncClient,
+        root_dir: str,
+        tmp_count: int,
+        track_url_dict: dict,
+        track_metadata: dict,
+        album_or_track_metadata: dict,
+        is_track: bool,
+        is_mp3: bool,
+        multiple: Optional[int] = None,
     ):
         extension = ".mp3" if is_mp3 else ".flac"
-
-        try:
-            url = track_url_dict["url"]
-        except KeyError:
+        url = track_url_dict.get("url")
+        if not url:
             logger.info(f"{OFF}Track not available for download")
             return
 
@@ -207,14 +268,9 @@ class Download:
             os.makedirs(root_dir, exist_ok=True)
 
         filename = os.path.join(root_dir, f".{tmp_count:02}.tmp")
-
-        # Determine the filename
         track_title = track_metadata.get("title")
         artist = _safe_get(track_metadata, "performer", "name")
         filename_attr = self._get_filename_attr(artist, track_metadata, track_title)
-
-        # track_format is a format string
-        # e.g. '{tracknumber}. {artist} - {tracktitle}'
         formatted_path = sanitize_filename(self.track_format.format(**filename_attr))
         final_file = os.path.join(root_dir, formatted_path)[:250] + extension
 
@@ -222,10 +278,13 @@ class Download:
             logger.info(f"{OFF}{track_title} was already downloaded")
             return
 
-        tqdm_download(url, filename, filename)
+        await rich_download(client, url, filename, self.progress, track_title)
         tag_function = metadata.tag_mp3 if is_mp3 else metadata.tag_flac
         try:
-            tag_function(
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None,
+                tag_function,
                 filename,
                 root_dir,
                 final_file,
@@ -273,63 +332,88 @@ class Download:
             "sampling_rate": sampling_rate,
         }
 
-    def _get_format(self, item_dict, is_track_id=False, track_url_dict=None):
+    async def _get_format(
+        self, item_dict, is_track_id=False, track_url_dict=None
+    ) -> Tuple[str, bool, Optional[int], Optional[int]]:
         quality_met = True
         if int(self.quality) == 5:
-            return ("MP3", quality_met, None, None)
+            return "MP3", quality_met, None, None
+
         track_dict = item_dict
         if not is_track_id:
             track_dict = item_dict["tracks"]["items"][0]
 
         try:
             new_track_dict = (
-                self.client.get_track_url(track_dict["id"], fmt_id=self.quality)
+                await self.client.get_track_url(track_dict["id"], fmt_id=self.quality)
                 if not track_url_dict
                 else track_url_dict
             )
             restrictions = new_track_dict.get("restrictions")
-            if isinstance(restrictions, list):
-                if any(
-                    restriction.get("code") == QL_DOWNGRADE
-                    for restriction in restrictions
-                ):
-                    quality_met = False
+            if isinstance(restrictions, list) and any(
+                r.get("code") == QL_DOWNGRADE for r in restrictions
+            ):
+                quality_met = False
 
             return (
                 "FLAC",
                 quality_met,
-                new_track_dict["bit_depth"],
-                new_track_dict["sampling_rate"],
+                new_track_dict.get("bit_depth"),
+                new_track_dict.get("sampling_rate"),
             )
-        except (KeyError, requests.exceptions.HTTPError):
-            return ("Unknown", quality_met, None, None)
+        except (KeyError, httpx.HTTPError):
+            return "Unknown", quality_met, None, None
+
+    async def _get_extra(
+        self,
+        client: httpx.AsyncClient,
+        item: str,
+        dirn: str,
+        extra: str = "cover.jpg",
+        og_quality: bool = False,
+    ):
+        extra_file = os.path.join(dirn, extra)
+        if os.path.isfile(extra_file):
+            logger.info(f"{OFF}{extra} was already downloaded")
+            return
+
+        url = item.replace("_600.", "_org.") if og_quality else item
+        await rich_download(client, url, extra_file, self.progress, extra)
 
 
-def tqdm_download(url, fname, desc):
-    r = requests.get(url, allow_redirects=True, stream=True)
-    total = int(r.headers.get("content-length", 0))
-    download_size = 0
-    with open(fname, "wb") as file, tqdm(
-        total=total,
-        unit="iB",
-        unit_scale=True,
-        unit_divisor=1024,
-        desc=desc,
-        bar_format=CYAN + "{n_fmt}/{total_fmt} /// {desc}",
-    ) as bar:
-        for data in r.iter_content(chunk_size=1024):
-            size = file.write(data)
-            bar.update(size)
-            download_size += size
+async def rich_download(
+    client: httpx.AsyncClient,
+    url: str,
+    fname: str,
+    progress: Progress,
+    desc: Optional[str] = None,
+):
+    """Asynchronously download a file with progress bar."""
+    task_id = progress.add_task(
+        f"[cyan]Downloading[/] [bold magenta]{desc or fname}[/]", total=0
+    )
 
-    if total != download_size:
-        # https://stackoverflow.com/questions/69919912/requests-iter-content-thinks-file-is-complete-but-its-not
-        raise ConnectionError("File download was interrupted for " + fname)
+    try:
+        async with client.stream("GET", url, follow_redirects=True) as r:
+            r.raise_for_status()
+            total = int(r.headers.get("content-length", 0))
+            progress.update(task_id, total=total)
+
+            download_size = 0
+            with open(fname, "wb") as file:
+                async for data in r.aiter_bytes(chunk_size=8192):
+                    size = file.write(data)
+                    progress.update(task_id, advance=size)
+                    download_size += size
+
+            if total != 0 and total != download_size:
+                raise ConnectionError(f"File download was interrupted for {fname}")
+    finally:
+        progress.update(task_id, visible=False)
 
 
 def _get_description(item: dict, track_title, multiple=None):
-    downloading_title = f"{track_title} "
-    f'[{item["bit_depth"]}/{item["sampling_rate"]}]'
+    downloading_title = f"{track_title} [{item.get('bit_depth')}/{item.get('sampling_rate')}]"
     if multiple:
         downloading_title = f"[Disc {multiple}] {downloading_title}"
     return downloading_title
@@ -347,23 +431,13 @@ def _get_title(item_dict):
     return album_title
 
 
-def _get_extra(item, dirn, extra="cover.jpg", og_quality=False):
-    extra_file = os.path.join(dirn, extra)
-    if os.path.isfile(extra_file):
-        logger.info(f"{OFF}{extra} was already downloaded")
-        return
-    tqdm_download(
-        item.replace("_600.", "_org.") if og_quality else item,
-        extra_file,
-        extra,
-    )
 
 
 def _clean_format_str(folder: str, track: str, file_format: str) -> Tuple[str, str]:
     """Cleans up the format strings, avoids errors
     with MP3 files.
     """
-    final = []
+    cleaned: list[str] = []
     for i, fs in enumerate((folder, track)):
         if fs.endswith(".mp3"):
             fs = fs[:-4]
@@ -381,25 +455,20 @@ def _clean_format_str(folder: str, track: str, file_format: str) -> Tuple[str, s
                 f". defaulting to {default}"
             )
             fs = default
-        final.append(fs)
+        cleaned.append(fs)
 
-    return tuple(final)
+    # Return a fixed-length tuple to satisfy typing (Tuple[str, str])
+    return cleaned[0], cleaned[1]
 
 
 def _safe_get(d: dict, *keys, default=None):
-    """A replacement for chained `get()` statements on dicts:
-    >>> d = {'foo': {'bar': 'baz'}}
-    >>> _safe_get(d, 'baz')
-    None
-    >>> _safe_get(d, 'foo', 'bar')
-    'baz'
-    """
+    """Safely traverse nested dicts using keys, returning default if any level is missing."""
     curr = d
-    res = default
-    for key in keys:
-        res = curr.get(key, default)
-        if res == default or not hasattr(res, "__getitem__"):
-            return res
-        else:
-            curr = res
-    return res
+    for i, key in enumerate(keys):
+        if not isinstance(curr, dict):
+            return default
+        val = curr.get(key, default)
+        if val is default:
+            return default
+        curr = val
+    return curr

@@ -3,7 +3,7 @@ import logging
 import re
 from collections import OrderedDict
 
-from requests import Session
+import httpx
 
 # Modified code based on DashLt's spoofbuz
 
@@ -22,27 +22,24 @@ _BUNDLE_URL_REGEX = re.compile(
 )
 
 _BASE_URL = "https://play.qobuz.com"
-_BUNDLE_URL_REGEX = re.compile(
-    r'<script src="(/resources/\d+\.\d+\.\d+-[a-z]\d{3}/bundle\.js)"></script>'
-)
 
 
 class Bundle:
     def __init__(self):
-        self._session = Session()
+        self._client = httpx.Client(follow_redirects=True, timeout=10.0)
 
-        logger.debug("Getting logging page")
-        response = self._session.get(f"{_BASE_URL}/login")
+        logger.debug("Getting login page")
+        response = self._client.get(f"{_BASE_URL}/login")
         response.raise_for_status()
 
         bundle_url_match = _BUNDLE_URL_REGEX.search(response.text)
         if not bundle_url_match:
-            raise NotImplementedError("Bundle URL found")
+            raise NotImplementedError("Bundle URL not found")
 
         bundle_url = bundle_url_match.group(1)
 
         logger.debug("Getting bundle")
-        response = self._session.get(_BASE_URL + bundle_url)
+        response = self._client.get(_BASE_URL + bundle_url)
         response.raise_for_status()
 
         self._bundle = response.text
