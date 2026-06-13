@@ -110,27 +110,23 @@ def smart_discography_filter(
         regex = TYPE_REGEXES[album_t]
         return re.search(regex, f"{title} {version}") is not None
 
-    def essence(album: dict) -> str:
+    def essence(title: str) -> str:
         """Ignore text in parens/brackets, return all lowercase.
         Used to group two albums that may be named similarly, but not exactly
         the same.
         """
-        title = str(album.get("title", ""))
+        title = str(title)
         m = re.match(r"^([^\(\[]+)", title)
         base = m.group(1) if m else title
         return base.strip().lower()
 
     requested_artist = contents[0]["name"]
-    items = [item["albums"]["items"] for item in contents][0]
+    items = contents[0]["albums"]["items"]
 
-    # use dicts to group duplicate albums together by title
+    # group duplicate albums together by (normalized) title
     title_grouped: dict[str, list[dict]] = {}
     for item in items:
-        title_ = essence(item["title"])
-        if title_ not in title_grouped:  # ?
-            #            if (t := essence(item["title"])) not in title_grouped:
-            title_grouped[title_] = []
-        title_grouped[title_].append(item)
+        title_grouped.setdefault(essence(item["title"]), []).append(item)
 
     items = []
     for albums in title_grouped.values():

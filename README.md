@@ -1,152 +1,183 @@
-# qobuz-dl
+# qobuz-dl (modernized fork) · v2.0.0
 
-[![Donate](https://img.shields.io/badge/Donate-PayPal-green.svg)](https://www.paypal.com/cgi-bin/webscr?cmd=_s-xclick&hosted_button_id=VZWSWVGZGJRMU&source=url)
+Search, explore, and download Lossless and Hi-Res music from [Qobuz](https://www.qobuz.com/).
 
-Search, explore, and download Lossless and Hi-Res music from [Qobuz](https://www.qobuz.com/). This project is a modernized, high-performance fork that *just works*™ (2025).
+> **This is a community fork.** It is a modernized, async rewrite of the original
+> [`qobuz-dl` by vitiko98](https://github.com/vitiko98/qobuz-dl), which is no
+> longer maintained. All credit for the original tool, the Qobuz API wrapper
+> (`qopy`, originally by **Sorrow446**), and the app-secret extraction
+> (`spoofbuz`, based on **DashLt**'s work) goes to those authors. This fork is
+> free and open source under the **GNU GPL v3** and focuses on getting the tool
+> *working again* on today's Qobuz, plus a broad code-quality overhaul.
+
+---
+
+## Why this fork exists
+
+In 2024–2025 Qobuz **removed the direct email/password login API** and moved
+authentication behind an OAuth flow protected by reCAPTCHA. The original
+`qobuz-dl` (unmaintained since ~2022) logged in with email + password and simply
+stopped working — every run failed at login.
+
+**This fork fixes that** by authenticating with a `user_auth_token` taken from a
+logged-in browser session instead of a password. You no longer log in from
+Python at all; you reuse the session your browser already established.
+
+The token is a short-lived JWT, so the fork also:
+
+- **Auto-refreshes** the token on every run (via the Qobuz `partner` endpoint)
+  and writes the fresh token back to your config — so as long as you run the
+  tool periodically, you rarely need to touch it again.
+- Ships a **browser login helper** (`qobuz-dl2 login`) that captures the token
+  for you, and a **`qobuz-dl2 set-token`** command for pasting one manually.
 
 ## Features
 
-- **Fast, Concurrent Downloads**: Utilizes an asynchronous architecture with `httpx` to download multiple tracks in parallel.
-- **Resilient Network**: Automatically retries failed downloads with exponential backoff using `tenacity`.
-- **Modern CLI**: A beautiful and intuitive command-line interface powered by `Click` and `rich`, complete with progress bars and rich formatting.
-- **Robust Package Management**: Uses `uv` for fast, reliable dependency management.
-- **Download Modes**:
-  - `dl`: Download albums, tracks, artists, playlists, and labels directly by URL.
-  - `fun`: Explore and download music interactively.
-  - `lucky`: Instantly download the top search result for a query.
-- **Duplicate Handling**: Prevents re-downloading tracks with a local database.
-- **And more**: Supports multi-disc albums, M3U playlist generation, extended tagging, and URL imports from text files.
+- **Token-based auth** that works with current Qobuz, with automatic refresh.
+- **Fast, concurrent downloads** via an async `httpx` architecture.
+- **Resilient networking**: transient download failures retry with exponential
+  backoff (`tenacity`) at the network level.
+- **Modern CLI** built on `Click` with `rich` progress bars.
+- **Download modes**: `dl` (by URL/text file), `fun` (interactive), `lucky`
+  (top search result).
+- **Smart extras**: multi-disc albums, M3U playlist generation, extended FLAC/MP3
+  tagging, cover art embedding, duplicate-download database, and an artist
+  "smart discography" filter.
 
-## Getting Started
+## Requirements
 
-> You'll need an **active Qobuz subscription**.
+- An **active Qobuz subscription** (free accounts cannot download).
+- Python ≥ 3.9.
 
-#### Installation
+## Installation
 
-Install and run globally with `uv`:
+This fork is installed **from source** (it is intentionally not published to
+PyPI under the original `qobuz-dl` name). Clone the repo, then install with
+[uv](https://docs.astral.sh/uv/) from the project directory:
 
 ```bash
-# Install the tool
-uv tool install qobuz-dl
+git clone <your-fork-url> qobuz-dl2
+cd qobuz-dl2
 
-# Run it
-qobuz-dl --help
+# Core tool — exposes the `qobuz-dl2` command
+uv tool install .
+
+# Optional: enable the browser login helper (qobuz-dl2 login)
+uv tool install --force ".[browser]"
+python -m playwright install chromium   # one-time browser download
 ```
 
-On your first run, the tool will prompt you to create a configuration file for your email, password, and default settings.
+On first run the tool creates a config file and asks for your token. You can
+leave it blank and capture it automatically afterward with `qobuz-dl2 login`.
+
+## Getting your token
+
+Pick whichever is easiest:
+
+### Option A — automatic (recommended)
+
+```bash
+qobuz-dl2 login
+```
+
+A browser window opens. **Log in to Qobuz normally** (type your password, solve
+any captcha — you do it, not a script). The window closes and your token is
+saved automatically. Requires the `[browser]` extra above.
+
+### Option B — paste it manually
+
+1. Log in at <https://play.qobuz.com>.
+2. Open **DevTools → Network**, filter by `login`.
+3. Click the `user/login` request → **Response** tab.
+4. Copy the value of `user_auth_token`.
+5. Store it:
+
+   ```bash
+   qobuz-dl2 set-token "PASTE_TOKEN_HERE"
+   ```
+
+If your token ever fully expires, the tool tells you exactly what to do; just
+re-run `qobuz-dl2 login` (or `set-token`).
 
 ## Usage
 
-The command-line interface is structured into three main commands: `dl`, `fun`, and `lucky`.
+```bash
+# Download by URL (album, track, artist, label, playlist, or a last.fm playlist)
+qobuz-dl2 dl https://open.qobuz.com/album/xxxxxxxxxxxxx
 
-```
-Usage: qobuz-dl [OPTIONS] COMMAND [ARGS]...
+# Download several at once, or from a text file of URLs
+qobuz-dl2 dl urls.txt https://open.qobuz.com/track/123456
 
-  The ultimate Qobuz music downloader.
+# Interactive search-and-pick
+qobuz-dl2 fun
 
-Options:
-  -r, --reset         Create or reset the configuration file.
-  -p, --purge         Purge/delete the downloaded-IDs database.
-  -sc, --show-config  Show the current configuration.
-  -h, --help          Show this message and exit.
-
-Commands:
-  dl     Download by URL for an album, track, artist, playlist, or label.
-  fun    Explore and download music interactively.
-  lucky  Download the first <n> results for a Qobuz search query.
+# Grab the top search result
+qobuz-dl2 lucky "miles davis kind of blue"
 ```
 
-### `dl` Command
+### Quality levels
 
-Download one or more items directly via their Qobuz URL.
-
-**Download an album in 24-bit / <=96kHz quality:**
+| ID | Quality                  |
+|----|--------------------------|
+| 5  | MP3 320                  |
+| 6  | 16-bit / 44.1 kHz (CD)   |
+| 7  | 24-bit / ≤ 96 kHz        |
+| 27 | 24-bit / > 96 kHz        |
 
 ```bash
-qobuz-dl dl https://play.qobuz.com/album/qxjbxh1dc3xyb -q 7
+qobuz-dl2 dl -q 27 <url>          # request best Hi-Res
+qobuz-dl2 dl --no-fallback -q 27  # skip releases not available at that quality
 ```
 
-**Download multiple URLs to a custom directory:**
+Run `qobuz-dl2 <command> --help` for the full option list (directory, naming
+formats, cover art, database, smart discography, etc.).
+
+## Configuration
+
+Config lives at:
+
+- Linux/macOS: `~/.config/qobuz-dl/config.ini`
+- Windows: `%APPDATA%\qobuz-dl\config.ini`
+
+`qobuz-dl2 -r` recreates it, `qobuz-dl2 -sc` prints it, and `qobuz-dl2 -p` purges the
+downloaded-IDs database. Your `user_auth_token` is stored (in the historical
+`password` field) **in plain text** — protect this file accordingly.
+
+## Development
 
 ```bash
-qobuz-dl dl https://play.qobuz.com/artist/2038380 https://play.qobuz.com/album/ip8qjy1m6dakc -d "My Music"
+uv sync                 # install dev dependencies
+uv run pytest           # run the test suite
+uv run ruff check .     # lint
+uv run mypy qobuz_dl2   # type-check
 ```
 
-**Download from a text file containing a list of URLs:**
+## What changed in this fork (v2.0.0)
 
-```bash
-qobuz-dl dl urls.txt
-```
+- **Auth:** replaced dead email/password login with `user_auth_token` auth +
+  automatic refresh and config write-back; added `login` and `set-token`.
+- **Bug fixes:** corrected a broken color f-string, an unhandled invalid-URL
+  error, an over-eager album-level retry that re-downloaded whole albums, a
+  filename-truncation bug that could mangle paths, a `KeyError` on missing MP3
+  copyright, a crash in `smart_discography`, and a swapped ℗/© copyright symbol.
+- **Robustness:** request timeouts, hardened secret extraction, graceful auth
+  errors, and proper HTTP-client cleanup.
+- **Maintainability:** de-duplicated the CLI commands, removed dead code,
+  dropped the `colorama` dependency, and added a `pytest` smoke suite.
 
-### `fun` Command
+## Credits
 
-Launch an interactive session to search for and select music to download.
+- This modernized fork is maintained by **4themusic**.
+- Original **qobuz-dl** by [vitiko98](https://github.com/vitiko98/qobuz-dl).
+- `qopy` Qobuz API wrapper originally by **Sorrow446**.
+- `spoofbuz` app-secret logic based on **DashLt**'s work.
 
-**Start interactive mode with a search result limit of 10:**
+## License
 
-```bash
-qobuz-dl fun -l 10
-```
+Free and open source under the **GNU General Public License v3.0 or later**
+(GPL-3.0-or-later). See [LICENSE](LICENSE) for the full text. You are free to
+use, study, share, and modify it; derivative works must remain under the same
+license.
 
-You will be prompted to choose a search type (Albums, Tracks, etc.) and then enter your query. Use the arrow keys and spacebar to select items from the results list.
-
-### `lucky` Command
-
-Download the top search result(s) for a given query without manual selection.
-
-**Download the first album result for "die lit":**
-
-```bash
-qobuz-dl lucky playboi carti die lit
-```
-
-**Download the top 5 artist results for "joy division":**
-
-```bash
-qobuz-dl lucky joy division -n 5 --type artist
-```
-
-## For Developers
-
-This project uses `uv` for package management and `hatchling` for builds.
-
-**1. Clone the repository:**
-
-```bash
-git clone https://github.com/vitiko98/Qobuz-DL.git
-cd Qobuz-DL
-```
-
-**2. Create a virtual environment and install dependencies:**
-
-```bash
-# Create a virtual environment
-uv venv
-
-# Activate it (macOS/Linux)
-source .venv/bin/activate
-
-# Install runtime and development dependencies
-uv sync -g dev
-```
-
-**3. Run the application from source:**
-
-```bash
-uv run qobuz-dl --help
-```
-
-**4. Run linters and type checkers:**
-
-```bash
-# Run ruff linter
-uv run ruff check .
-
-# Run mypy type checker
-uv run mypy .
-```
-
-## Disclaimer
-
-- This tool is for educational purposes only. By using it, you accept the [Qobuz API Terms of Use](https://static.qobuz.com/apps/api/QobuzAPI-TermsofUse.pdf).
-- `qobuz-dl` is not affiliated with Qobuz.
+This tool is intended for downloading music you are entitled to through your own
+Qobuz subscription.

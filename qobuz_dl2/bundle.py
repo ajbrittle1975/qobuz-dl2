@@ -26,23 +26,24 @@ _BASE_URL = "https://play.qobuz.com"
 
 class Bundle:
     def __init__(self):
-        self._client = httpx.Client(follow_redirects=True, timeout=10.0)
+        # The client is only needed to fetch the bundle once, so use it as a
+        # context manager to avoid leaking the connection pool.
+        with httpx.Client(follow_redirects=True, timeout=10.0) as client:
+            logger.debug("Getting login page")
+            response = client.get(f"{_BASE_URL}/login")
+            response.raise_for_status()
 
-        logger.debug("Getting login page")
-        response = self._client.get(f"{_BASE_URL}/login")
-        response.raise_for_status()
+            bundle_url_match = _BUNDLE_URL_REGEX.search(response.text)
+            if not bundle_url_match:
+                raise NotImplementedError("Bundle URL not found")
 
-        bundle_url_match = _BUNDLE_URL_REGEX.search(response.text)
-        if not bundle_url_match:
-            raise NotImplementedError("Bundle URL not found")
+            bundle_url = bundle_url_match.group(1)
 
-        bundle_url = bundle_url_match.group(1)
+            logger.debug("Getting bundle")
+            response = client.get(_BASE_URL + bundle_url)
+            response.raise_for_status()
 
-        logger.debug("Getting bundle")
-        response = self._client.get(_BASE_URL + bundle_url)
-        response.raise_for_status()
-
-        self._bundle = response.text
+            self._bundle = response.text
 
     def get_app_id(self):
         match = _APP_ID_REGEX.search(self._bundle)
@@ -61,6 +62,11 @@ class Bundle:
             secrets[timezone] = [seed]
 
         keypairs = list(secrets.items())
+        if len(keypairs) < 2:
+            raise NotImplementedError(
+                "Failed to extract app secrets from the Qobuz bundle "
+                "(the bundle format may have changed). Try 'qobuz-dl2 -r'."
+            )
         secrets.move_to_end(keypairs[1][0], last=False)
         info_extras_regex = _INFO_EXTRAS_REGEX.format(
             timezones="|".join([timezone.capitalize() for timezone in secrets])

@@ -1,20 +1,26 @@
 import asyncio
 import configparser
 import glob
-import hashlib
 import logging
 import os
 import sys
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 import click
 
-from qobuz_dl.bundle import Bundle
-from qobuz_dl.color import GREEN, RED, YELLOW
-from qobuz_dl.core import QobuzDL
-from qobuz_dl.downloader import DEFAULT_FOLDER, DEFAULT_TRACK
+from qobuz_dl2.bundle import Bundle
+from qobuz_dl2.color import GREEN, RED, RESET, YELLOW
+from qobuz_dl2.core import QobuzDL
+from qobuz_dl2.downloader import DEFAULT_FOLDER, DEFAULT_TRACK
+from qobuz_dl2.exceptions import (
+    AuthenticationError,
+    IneligibleError,
+    InvalidAppSecretError,
+)
 
-logging.basicConfig(level=logging.INFO, format="%(message)s")
+# Reset styling at the end of every line so colors don't bleed (colorama's old
+# autoreset behavior, reproduced without the dependency).
+logging.basicConfig(level=logging.INFO, format=f"%(message)s{RESET}")
 
 if os.name == "nt":
     # Ensure a valid string path even if APPDATA is unset
@@ -27,12 +33,28 @@ CONFIG_FILE = os.path.join(CONFIG_PATH, "config.ini")
 QOBUZ_DB = os.path.join(CONFIG_PATH, "qobuz_dl.db")
 
 
+TOKEN_PROMPT = (
+    "Enter your Qobuz user_auth_token.\n"
+    "Qobuz removed email/password login, so qobuz-dl authenticates with a\n"
+    "token from a logged-in browser session.\n"
+    "\n"
+    "EASIEST: leave this blank and afterwards run 'qobuz-dl2 login' to capture\n"
+    "the token automatically in a browser window (needs the [browser] extra).\n"
+    "\n"
+    "Or paste it manually: log in at https://play.qobuz.com, open\n"
+    "DevTools > Network, filter by 'login', click the 'user/login' request,\n"
+    "open the Response tab, and copy the value of 'user_auth_token'.\n"
+    "- "
+)
+
+
 def _reset_config(config_file: str) -> None:
     logging.info(f"{YELLOW}Creating config file: {config_file}")
     config = configparser.ConfigParser()
-    config["DEFAULT"]["email"] = input("Enter your email:\n- ")
-    password = input("Enter your password\n- ")
-    config["DEFAULT"]["password"] = hashlib.md5(password.encode("utf-8")).hexdigest()
+    config["DEFAULT"]["email"] = input("Enter your email (optional, for reference):\n- ")
+    # The token is stored verbatim in the historical "password" field so existing
+    # config files keep working. It must NOT be hashed.
+    config["DEFAULT"]["password"] = input(TOKEN_PROMPT).strip()
     config["DEFAULT"]["default_folder"] = (
         input("Folder for downloads (leave empty for default 'Qobuz Downloads')\n- ")
         or "Qobuz Downloads"
@@ -66,8 +88,17 @@ def _reset_config(config_file: str) -> None:
     logging.info(
         f"{GREEN}Config file updated. Edit more options in {config_file}"
         "\nso you don't have to call custom flags every time you run "
-        "a qobuz-dl command."
+        "a qobuz-dl2 command."
     )
+
+
+def _save_token(token: str) -> None:
+    """Persist a refreshed user_auth_token back to the config file."""
+    cfg = configparser.ConfigParser()
+    cfg.read(CONFIG_FILE)
+    cfg["DEFAULT"]["password"] = token
+    with open(CONFIG_FILE, "w") as f:
+        cfg.write(f)
 
 
 def _remove_leftovers(directory: str) -> None:
@@ -89,7 +120,7 @@ def _load_config() -> Dict[str, Any]:
     cfg = configparser.ConfigParser()
     cfg.read(CONFIG_FILE)
     try:
-        email = cfg["DEFAULT"]["email"]
+        email = cfg["DEFAULT"].get("email", "")
         password = cfg["DEFAULT"]["password"]
         default_folder = cfg["DEFAULT"]["default_folder"]
         default_limit = cfg["DEFAULT"]["default_limit"]
@@ -109,7 +140,7 @@ def _load_config() -> Dict[str, Any]:
     except (KeyError, UnicodeDecodeError, configparser.Error) as error:
         raise RuntimeError(
             f"{RED}Your config file is corrupted: {error}! "
-            "Run 'qobuz-dl -r' to fix this."
+            "Run 'qobuz-dl2 -r' to fix this."
         )
     return {
         "email": email,
@@ -182,7 +213,7 @@ async def _build_qobuz(
     }
     q = QobuzDL(**effective)
     await q.initialize_client(
-        cfg["email"], cfg["password"], cfg["app_id"], cfg["secrets"]
+        cfg["password"], cfg["app_id"], cfg["secrets"], on_token_refresh=_save_token
     )
     return q
 
@@ -283,14 +314,46 @@ def cli(ctx: click.Context, reset: bool, purge: bool, show_config: bool) -> None
             os.remove(QOBUZ_DB)
         except FileNotFoundError:
             pass
-        click.echo(f"{GREEN}The database was deleted.")
+        click.echo(f"{GREEN}The database was deleted.{RESET}")
         ctx.exit(0)
 
     try:
         ctx.obj = _load_config()
     except RuntimeError as e:
-        click.echo(str(e))
+        click.echo(f"{str(e)}{RESET}")
         ctx.exit(2)
+
+
+def _run(
+    ctx: click.Context,
+    opts: Dict[str, Any],
+    action: Callable[[QobuzDL], Awaitable[None]],
+) -> None:
+    """Build a client from the shared options and run an async action with
+    uniform auth-error handling, Ctrl-C handling and temp-file cleanup."""
+
+    async def runner() -> None:
+        try:
+            q = await _build_qobuz(ctx, **opts)
+        except (
+            AuthenticationError,
+            IneligibleError,
+            InvalidAppSecretError,
+        ) as e:
+            logging.error(f"{RED}{e}")
+            return
+        try:
+            await action(q)
+        except KeyboardInterrupt:
+            logging.info(
+                f"{RED}Interrupted by user\n{YELLOW}Already downloaded items will "
+                "be skipped if you try to download the same releases again."
+            )
+        finally:
+            await q.aclose()
+            _remove_leftovers(q.directory)
+
+    asyncio.run(runner())
 
 
 @cli.command("fun")
@@ -303,104 +366,24 @@ def cli(ctx: click.Context, reset: bool, purge: bool, show_config: bool) -> None
     help="limit of search results (default from config)",
 )
 @click.pass_context
-def fun_cmd(
-    ctx: click.Context,
-    limit: Optional[int],
-    directory: Optional[str],
-    quality: Optional[int],
-    embed_art: Optional[bool],
-    albums_only: Optional[bool],
-    no_m3u: Optional[bool],
-    no_fallback: Optional[bool],
-    og_cover: Optional[bool],
-    no_cover: Optional[bool],
-    no_db: Optional[bool],
-    folder_format: Optional[str],
-    track_format: Optional[str],
-    smart_discography: Optional[bool],
-) -> None:
+def fun_cmd(ctx: click.Context, limit: Optional[int], **opts: Any) -> None:
     """Interactive mode."""
 
-    async def runner() -> None:
-        q = await _build_qobuz(
-            ctx,
-            directory=directory,
-            quality=quality,
-            embed_art=embed_art,
-            albums_only=albums_only,
-            no_m3u=no_m3u,
-            no_fallback=no_fallback,
-            og_cover=og_cover,
-            no_cover=no_cover,
-            no_db=no_db,
-            folder_format=folder_format,
-            track_format=track_format,
-            smart_discography=smart_discography,
-        )
+    async def action(q: QobuzDL) -> None:
         dflt_limit = ctx.obj["defaults"]["default_limit"]
         q.interactive_limit = int(limit) if limit is not None else int(dflt_limit)
-        try:
-            await q.interactive()
-        except KeyboardInterrupt:
-            logging.info(
-                f"{RED}Interrupted by user\n{YELLOW}Already downloaded items will "
-                "be skipped if you try to download the same releases again."
-            )
-        finally:
-            _remove_leftovers(q.directory)
+        await q.interactive()
 
-    asyncio.run(runner())
+    _run(ctx, opts, action)
 
 
 @cli.command("dl")
 @_common_options()
 @click.argument("source", nargs=-1, required=True)
 @click.pass_context
-def dl_cmd(
-    ctx: click.Context,
-    source: tuple[str, ...],
-    directory: Optional[str],
-    quality: Optional[int],
-    embed_art: Optional[bool],
-    albums_only: Optional[bool],
-    no_m3u: Optional[bool],
-    no_fallback: Optional[bool],
-    og_cover: Optional[bool],
-    no_cover: Optional[bool],
-    no_db: Optional[bool],
-    folder_format: Optional[str],
-    track_format: Optional[str],
-    smart_discography: Optional[bool],
-) -> None:
+def dl_cmd(ctx: click.Context, source: tuple[str, ...], **opts: Any) -> None:
     """Input mode: download by album/track/artist/label/playlist/last.fm-playlist URL(s) or a text file."""
-
-    async def runner() -> None:
-        q = await _build_qobuz(
-            ctx,
-            directory=directory,
-            quality=quality,
-            embed_art=embed_art,
-            albums_only=albums_only,
-            no_m3u=no_m3u,
-            no_fallback=no_fallback,
-            og_cover=og_cover,
-            no_cover=no_cover,
-            no_db=no_db,
-            folder_format=folder_format,
-            track_format=track_format,
-            smart_discography=smart_discography,
-        )
-        try:
-            await q.download_list_of_urls(list(source))
-        except KeyboardInterrupt:
-            logging.info(
-                f"{RED}Interrupted by user\n{YELLOW}Already downloaded items will "
-                "be skipped if you try to download the same releases again."
-            )
-        finally:
-            _remove_leftovers(q.directory)
-
-    asyncio.run(runner())
+    _run(ctx, opts, lambda q: q.download_list_of_urls(list(source)))
 
 
 @cli.command("lucky")
@@ -429,57 +412,65 @@ def lucky_cmd(
     query: tuple[str, ...],
     type_: Optional[str],
     number: Optional[int],
-    directory: Optional[str],
-    quality: Optional[int],
-    embed_art: Optional[bool],
-    albums_only: Optional[bool],
-    no_m3u: Optional[bool],
-    no_fallback: Optional[bool],
-    og_cover: Optional[bool],
-    no_cover: Optional[bool],
-    no_db: Optional[bool],
-    folder_format: Optional[str],
-    track_format: Optional[str],
-    smart_discography: Optional[bool],
+    **opts: Any,
 ) -> None:
     """Lucky mode: Download the first <n> results from a Qobuz search."""
 
-    async def runner() -> None:
-        q = await _build_qobuz(
-            ctx,
-            directory=directory,
-            quality=quality,
-            embed_art=embed_art,
-            albums_only=albums_only,
-            no_m3u=no_m3u,
-            no_fallback=no_fallback,
-            og_cover=og_cover,
-            no_cover=no_cover,
-            no_db=no_db,
-            folder_format=folder_format,
-            track_format=track_format,
-            smart_discography=smart_discography,
-        )
+    async def action(q: QobuzDL) -> None:
         q.lucky_type = (type_ or "album").lower()
         q.lucky_limit = int(number) if number is not None else 1
-        query_str = " ".join(query)
-        try:
-            await q.lucky_mode(query_str)
-        except KeyboardInterrupt:
-            logging.info(
-                f"{RED}Interrupted by user\n{YELLOW}Already downloaded items will "
-                "be skipped if you try to download the same releases again."
-            )
-        finally:
-            _remove_leftovers(q.directory)
+        await q.lucky_mode(" ".join(query))
 
-    asyncio.run(runner())
+    _run(ctx, opts, action)
+
+
+@cli.command("login")
+@click.option(
+    "--timeout",
+    type=int,
+    default=300,
+    show_default=True,
+    help="seconds to wait for you to finish logging in",
+)
+@click.pass_context
+def login_cmd(ctx: click.Context, timeout: int) -> None:
+    """Open a browser to log in to Qobuz and capture your token automatically."""
+    from qobuz_dl2.browser_login import fetch_token_via_browser
+
+    click.echo(
+        f"{YELLOW}Opening a browser window. Log in to Qobuz as usual "
+        "(solve any captcha yourself).\nThis window will close and your token "
+        "will be saved automatically once you're in."
+    )
+    try:
+        token = fetch_token_via_browser(timeout=timeout)
+    except RuntimeError as e:
+        click.echo(f"{RED}{e}{RESET}")
+        ctx.exit(1)
+        return
+    if not token:
+        click.echo(
+            f"{RED}No token captured (login not completed or window closed). "
+            "Please try again."
+        )
+        ctx.exit(1)
+        return
+    _save_token(token)
+    click.echo(f"{GREEN}Token captured and saved to {CONFIG_FILE}{RESET}")
+
+
+@cli.command("set-token")
+@click.argument("token")
+def set_token_cmd(token: str) -> None:
+    """Store a fresh Qobuz user_auth_token in the config (no browser needed)."""
+    _save_token(token.strip())
+    click.echo(f"{GREEN}Token saved to {CONFIG_FILE}{RESET}")
 
 
 def main() -> int:
     # If no subcommand provided, Click will show help automatically.
     try:
-        cli(prog_name="qobuz-dl", standalone_mode=True)
+        cli(prog_name="qobuz-dl2", standalone_mode=True)
         return 0
     except SystemExit as e:
         # Normalize exit code

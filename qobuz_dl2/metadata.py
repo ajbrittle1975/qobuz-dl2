@@ -9,8 +9,8 @@ from mutagen.id3._util import ID3NoHeaderError  # type: ignore[attr-defined]
 logger = logging.getLogger(__name__)
 
 
-# unicode symbols
-COPYRIGHT, PHON_COPYRIGHT = "\u2117", "\u00a9"
+# unicode symbols: \u00a9 is the copyright sign, \u2117 is the sound-recording (phonogram) sign
+COPYRIGHT, PHON_COPYRIGHT = "\u00a9", "\u2117"
 # if a metadata block exceeds this, mutagen will raise error
 # and the file won't be tagged
 FLAC_MAX_BLOCKSIZE = 16777215
@@ -214,14 +214,14 @@ def tag_mp3(filename, root_dir, final_name, d, album, istrack=True, em_image=Fal
         tags["albumartist"] = d["album"]["artist"]["name"]
         tags["album"] = d["album"]["title"]
         tags["date"] = d["album"]["release_date_original"]
-        tags["copyright"] = _format_copyright(d["copyright"])
+        tags["copyright"] = _format_copyright(d.get("copyright") or "n/a")
         tracktotal = str(d["album"]["tracks_count"])
     else:
         tags["genre"] = _format_genres(album["genres_list"])
         tags["albumartist"] = album["artist"]["name"]
         tags["album"] = album["title"]
         tags["date"] = album["release_date_original"]
-        tags["copyright"] = _format_copyright(album["copyright"])
+        tags["copyright"] = _format_copyright(album.get("copyright") or "n/a")
         tracktotal = str(album["tracks_count"])
 
     tags["year"] = tags["date"][:4]

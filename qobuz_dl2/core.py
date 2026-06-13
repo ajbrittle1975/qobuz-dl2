@@ -6,12 +6,12 @@ import httpx
 from bs4 import BeautifulSoup as bso
 from pathvalidate import sanitize_filename
 
-from qobuz_dl import downloader, qopy
-from qobuz_dl.bundle import Bundle
-from qobuz_dl.color import CYAN, DF, OFF, RED, RESET, YELLOW
-from qobuz_dl.db import create_db, handle_download_id
-from qobuz_dl.exceptions import NonStreamable
-from qobuz_dl.utils import (
+from qobuz_dl2 import downloader, qopy
+from qobuz_dl2.bundle import Bundle
+from qobuz_dl2.color import CYAN, OFF, RED, RESET, YELLOW
+from qobuz_dl2.db import create_db, handle_download_id
+from qobuz_dl2.exceptions import NonStreamable
+from qobuz_dl2.utils import (
     PartialFormatter,
     create_and_return_dir,
     format_duration,
@@ -69,10 +69,18 @@ class QobuzDL:
         self.track_format = track_format
         self.smart_discography = smart_discography
 
-    async def initialize_client(self, email, pwd, app_id, secrets):
-        self.client = qopy.Client(email, pwd, app_id, secrets)
-        await self.client.initialize(email, pwd)
+    async def initialize_client(self, token, app_id, secrets, on_token_refresh=None):
+        self.client = qopy.Client(
+            token, app_id, secrets, on_token_refresh=on_token_refresh
+        )
+        await self.client.initialize()
         logger.info(f"{YELLOW}Set max quality: {QUALITIES[int(self.quality)]}\n")
+
+    async def aclose(self):
+        """Close the underlying HTTP client, if one was created."""
+        client = getattr(self, "client", None)
+        if client is not None:
+            await client.aclose()
 
     def get_tokens(self):
         bundle = Bundle()
@@ -128,7 +136,7 @@ class QobuzDL:
         try:
             url_type, item_id = get_url_info(url)
             type_dict = possibles[url_type]
-        except (KeyError, IndexError):
+        except (KeyError, IndexError, ValueError):
             logger.info(
                 f'{RED}Invalid url: "{url}". Use urls from ' "https://play.qobuz.com!"
             )
@@ -186,7 +194,7 @@ class QobuzDL:
                 logger.error(f"{RED}Invalid text file: {e}")
                 return
             logger.info(
-                f"{YELLOW}qobuz-dl will download {len(urls)} urls from file: {txt_file}"
+                f"{YELLOW}qobuz-dl2 will download {len(urls)} urls from file: {txt_file}"
             )
             await self.download_list_of_urls(urls)
 
@@ -197,7 +205,7 @@ class QobuzDL:
 
         logger.info(
             f'{YELLOW}Searching {self.lucky_type}s for "{query}".\n'
-            f"{YELLOW}qobuz-dl will attempt to download the first {self.lucky_limit} results."
+            f"{YELLOW}qobuz-dl2 will attempt to download the first {self.lucky_limit} results."
         )
         results = await self.search_by_type(
             query, self.lucky_type, self.lucky_limit, True
@@ -210,7 +218,7 @@ class QobuzDL:
 
     async def search_by_type(self, query, item_type, limit=10, lucky=False):
         if len(query) < 3:
-            logger.info("{RED}Your search query is too short or invalid")
+            logger.info(f"{RED}Your search query is too short or invalid")
             return []
 
         possibles = {
@@ -294,7 +302,7 @@ class QobuzDL:
             logger.info(f"{YELLOW}Ok, we'll search for {selected_type}s{RESET}")
             final_url_list = []
             while True:
-                query = input(f"{CYAN}Enter your search: [Ctrl + c to quit]\n-{DF} ")
+                query = input(f"{CYAN}Enter your search: [Ctrl + c to quit]\n-{RESET} ")
                 if not query:
                     continue
                 logger.info(f"{YELLOW}Searching...{RESET}")

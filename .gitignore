@@ -1,2 +1,13 @@
 Qobuz Downloads
 __pycache__
+
+# Removed memory tooling (ConPort / Roo memory-bank) — kept out of the repo
+context_portal/
+memory-bank/
+.roo/
+
+# Local env / tooling caches
+.venv/
+.mypy_cache/
+.ruff_cache/
+.DS_Store

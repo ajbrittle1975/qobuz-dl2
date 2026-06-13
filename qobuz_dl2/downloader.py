@@ -15,9 +15,9 @@ from rich.progress import (
 )
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-import qobuz_dl.metadata as metadata
-from qobuz_dl.color import GREEN, OFF, RED, YELLOW
-from qobuz_dl.exceptions import NonStreamable
+import qobuz_dl2.metadata as metadata
+from qobuz_dl2.color import GREEN, OFF, RED, YELLOW
+from qobuz_dl2.exceptions import NonStreamable
 
 QL_DOWNGRADE = "FormatRestrictedByFormatAvailability"
 # used in case of error
@@ -88,11 +88,6 @@ class Download:
                 else:
                     await self.download_track(client)
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type(httpx.HTTPError),
-    )
     async def download_release(self, client: httpx.AsyncClient):
         meta = await self.client.get_album_meta(self.item_id)
 
@@ -101,7 +96,7 @@ class Download:
 
         if self.albums_only and (
             meta.get("release_type") != "album"
-            or meta.get("artist").get("name") == "Various Artists"
+            or _safe_get(meta, "artist", "name") == "Various Artists"
         ):
             logger.info(f'{OFF}Ignoring Single/EP/VA: {meta.get("title", "n/a")}')
             return
@@ -272,7 +267,9 @@ class Download:
         artist = _safe_get(track_metadata, "performer", "name")
         filename_attr = self._get_filename_attr(artist, track_metadata, track_title)
         formatted_path = sanitize_filename(self.track_format.format(**filename_attr))
-        final_file = os.path.join(root_dir, formatted_path)[:250] + extension
+        # Truncate only the file name (not the directory) to stay within
+        # filesystem name limits, then add the extension.
+        final_file = os.path.join(root_dir, formatted_path[:250]) + extension
 
         if os.path.isfile(final_file):
             logger.info(f"{OFF}{track_title} was already downloaded")
@@ -381,6 +378,30 @@ class Download:
         await rich_download(client, url, extra_file, self.progress, extra)
 
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type((httpx.HTTPError, ConnectionError)),
+)
+async def _stream_to_file(
+    client: httpx.AsyncClient, url: str, fname: str, progress: Progress, task_id
+) -> None:
+    download_size = 0
+    async with client.stream("GET", url, follow_redirects=True) as r:
+        r.raise_for_status()
+        total = int(r.headers.get("content-length", 0))
+        # Reset in case this is a retry of a partially-completed attempt.
+        progress.update(task_id, total=total, completed=0)
+        with open(fname, "wb") as file:
+            async for data in r.aiter_bytes(chunk_size=8192):
+                size = file.write(data)
+                progress.update(task_id, advance=size)
+                download_size += size
+
+    if total != 0 and total != download_size:
+        raise ConnectionError(f"File download was interrupted for {fname}")
+
+
 async def rich_download(
     client: httpx.AsyncClient,
     url: str,
@@ -388,35 +409,15 @@ async def rich_download(
     progress: Progress,
     desc: Optional[str] = None,
 ):
-    """Asynchronously download a file with progress bar."""
+    """Asynchronously download a file with a progress bar, retrying on
+    transient network errors."""
     task_id = progress.add_task(
         f"[cyan]Downloading[/] [bold magenta]{desc or fname}[/]", total=0
     )
-
     try:
-        async with client.stream("GET", url, follow_redirects=True) as r:
-            r.raise_for_status()
-            total = int(r.headers.get("content-length", 0))
-            progress.update(task_id, total=total)
-
-            download_size = 0
-            with open(fname, "wb") as file:
-                async for data in r.aiter_bytes(chunk_size=8192):
-                    size = file.write(data)
-                    progress.update(task_id, advance=size)
-                    download_size += size
-
-            if total != 0 and total != download_size:
-                raise ConnectionError(f"File download was interrupted for {fname}")
+        await _stream_to_file(client, url, fname, progress, task_id)
     finally:
         progress.update(task_id, visible=False)
-
-
-def _get_description(item: dict, track_title, multiple=None):
-    downloading_title = f"{track_title} [{item.get('bit_depth')}/{item.get('sampling_rate')}]"
-    if multiple:
-        downloading_title = f"[Disc {multiple}] {downloading_title}"
-    return downloading_title
 
 
 def _get_title(item_dict):
